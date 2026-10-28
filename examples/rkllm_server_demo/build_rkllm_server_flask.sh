@@ -82,7 +82,7 @@ fi
 if ! python3 -c "import flask" &> /dev/null; then
     echo "-------- flask is not installed. Installing it now... --------"
     # 安装 flask
-    pip install flask==2.2.2 Werkzeug==2.2.2 -i https://pypi.tuna.tsinghua.edu.cn/simple --break-system-packages
+    pip install flask==2.2.2 Werkzeug==2.2.2 -i https://pypi.tuna.tsinghua.edu.cn/simple
 else
     echo "-------- flask is already installed. --------"
 fi

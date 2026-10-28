@@ -85,6 +85,10 @@ class RKLLMClient:
             verify=False,
         )
         r.raise_for_status()
+        # The server replies without an explicit charset; requests would then
+        # fall back to ISO-8859-1 and mangle non-ASCII output.
+        if not r.encoding or r.encoding.lower() in ("iso-8859-1", "latin-1"):
+            r.encoding = "utf-8"
 
         if not stream:
             return r.json()
@@ -97,7 +101,13 @@ class RKLLMClient:
         return response["choices"][0]["message"]["content"]
 
     def _parse_stream(self, response):
-        """Generator that yields delta text chunks from an SSE stream."""
+        """Generator that yields delta text chunks from an SSE stream.
+
+        Yields dicts with keys: content, tool_calls, finish_reason.
+        `tool_calls` is a list of OpenAI-style tool call dicts (possibly partial
+        while streaming); it is None until the model starts a tool call.
+        """
+        tool_calls = []
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -110,7 +120,28 @@ class RKLLMClient:
                     delta = chunk["choices"][0].get("delta", {})
                     content = delta.get("content", "")
                     finish = chunk["choices"][0].get("finish_reason")
-                    yield {"content": content, "finish_reason": finish}
+                    for tc in delta.get("tool_calls", []) or []:
+                        idx = tc.get("index", len(tool_calls))
+                        while len(tool_calls) <= idx:
+                            tool_calls.append({
+                                "id": None, "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            })
+                        entry = tool_calls[idx]
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        if tc.get("type"):
+                            entry["type"] = tc["type"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            entry["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            entry["function"]["arguments"] += fn["arguments"]
+                    yield {
+                        "content": content,
+                        "tool_calls": tool_calls if tool_calls else None,
+                        "finish_reason": finish,
+                    }
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
 
@@ -303,6 +334,12 @@ def execute_tool_calls(tool_calls):
         fn = tc.get("function", tc)
         name = fn.get("name", "")
         args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        call_id = tc.get("id") or f"call_{name}"
 
         # Execute the function
         if name in FUNCTION_MAP:
@@ -312,14 +349,19 @@ def execute_tool_calls(tool_calls):
 
         # Build normalized tool_call entry
         normalized.append({
-            "id": f"call_{name}",
+            "id": call_id,
             "type": "function",
             "function": {
                 "name": name,
                 "arguments": json.dumps(args, ensure_ascii=False),
             },
         })
-        tool_msgs.append({"role": "tool", "name": name, "content": json.dumps(result, ensure_ascii=False)})
+        tool_msgs.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": name,
+            "content": json.dumps(result, ensure_ascii=False),
+        })
 
     assistant_msg = {"role": "assistant", "content": None, "tool_calls": normalized}
     return assistant_msg, tool_msgs
@@ -349,14 +391,21 @@ def demo_function_call(client, stream=True):
     print(f"\nQ: {messages[-1]['content']}\n")
 
     resp = client.chat(messages=messages, tools=TOOLS, stream=False)
-    server_answer = resp["choices"][0]["message"]["content"]
-    print(f"[Model tool-call response]:\n{textwrap.indent(server_answer, '  ')}\n")
+    message = resp["choices"][0]["message"]
+    server_answer = message.get("content") or ""
 
-    tool_calls = parse_tool_calls(server_answer)
+    # The server returns OpenAI-style `tool_calls`; fall back to parsing the
+    # raw text for models that emit the tool call inline.
+    tool_calls = message.get("tool_calls")
+    if not tool_calls:
+        tool_calls = parse_tool_calls(server_answer)
+
     if not tool_calls:
         print("No tool calls detected — model answered directly.")
         print(f"A: {server_answer}")
         return
+
+    print(f"[Model tool-call response]:\n{textwrap.indent(json.dumps(tool_calls, indent=2, ensure_ascii=False), '  ')}\n")
     
     # --- Step 2: Execute tool calls ---
     assistant_msg, tool_msgs = execute_tool_calls(tool_calls)

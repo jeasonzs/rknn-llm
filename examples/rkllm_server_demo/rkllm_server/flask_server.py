@@ -409,19 +409,23 @@ class RKLLM(object):
 # OpenAI-compatible helpers
 # ---------------------------------------------------------------------------
 
-def build_openai_response(model_name, content, finish_reason="stop", prompt_tokens=0, completion_tokens=0):
+def build_openai_response(model_name, content, finish_reason="stop", prompt_tokens=0,
+                          completion_tokens=0, tool_calls=None, response_id=None):
     """Build a standard OpenAI chat completion response."""
+    message = {
+        "role": "assistant",
+        "content": content
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "id": response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model_name,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
+            "message": message,
             "logprobs": None,
             "finish_reason": finish_reason
         }],
@@ -433,21 +437,135 @@ def build_openai_response(model_name, content, finish_reason="stop", prompt_toke
     }
 
 
-def build_openai_stream_chunk(model_name, delta_content, finish_reason=None, index=0):
-    """Build a standard OpenAI streaming chat completion chunk."""
+def build_openai_stream_chunk(chunk_id, model_name, delta, finish_reason=None, index=0):
+    """Build a standard OpenAI streaming chat completion chunk.
+
+    `delta` is the delta dict, e.g. {"role": "assistant"}, {"content": "hi"} or
+    {"tool_calls": [...]}.
+    """
     chunk = {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "id": chunk_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model_name,
         "choices": [{
             "index": index,
-            "delta": {"role": "assistant"} if delta_content is None else {"content": delta_content},
+            "delta": delta,
             "logprobs": None,
             "finish_reason": finish_reason
         }]
     }
-    return f"data: {json.dumps(chunk)}\n\n"
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Tool call (function calling) parsing
+# ---------------------------------------------------------------------------
+#
+# The RKLLM runtime renders a tool call into the model output as:
+#     <tool_call>
+#     {"name": "get_current_temperature", "arguments": {"location": "Beijing"}}
+#     </tool_call>
+# Some models instead use an XML-like flavour:
+#     <tool_call>
+#     <function=get_temperature_date>
+#     <parameter=location>Beijing</parameter>
+#     </function>
+#     </tool_call>
+# Both are parsed here and converted into the OpenAI `tool_calls` format.
+
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
+TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+FUNCTION_BLOCK_RE = re.compile(r"<function=(\S+)>\s*(.*?)\s*</function>", re.DOTALL)
+PARAM_BLOCK_RE = re.compile(r"<parameter=(\S+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+
+
+def _coerce_arg_value(value):
+    """Turn a raw parameter string into a JSON-friendly value when possible."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
+
+def _parse_tool_call_block(block):
+    """Parse a single <tool_call> block body -> {"name": str, "arguments": dict}."""
+    block = block.strip()
+    if not block:
+        return None
+
+    # --- JSON flavour ---
+    obj = None
+    try:
+        obj = json.loads(block)
+    except (json.JSONDecodeError, TypeError):
+        obj = None
+
+    if isinstance(obj, dict):
+        # Accept both {"name":..,"arguments":..} and {"function": {...}}
+        fn = obj.get("function") if isinstance(obj.get("function"), dict) else obj
+        name = fn.get("name", "")
+        args = fn.get("arguments", fn.get("parameters", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                args = {"input": args}
+        if not isinstance(args, dict):
+            args = {} if args is None else {"input": args}
+        return {"name": name, "arguments": args}
+
+    # --- XML-like flavour ---
+    for func_name, params_block in FUNCTION_BLOCK_RE.findall(block):
+        arguments = {}
+        for param_name, param_value in PARAM_BLOCK_RE.findall(params_block):
+            arguments[param_name] = _coerce_arg_value(param_value.strip())
+        return {"name": func_name, "arguments": arguments}
+
+    return None
+
+
+def parse_tool_calls(text):
+    """Extract tool calls from raw model output.
+
+    Returns a tuple (clean_text, tool_calls) where:
+      - clean_text is the model output with the <tool_call> blocks removed
+      - tool_calls is a list of {"name": str, "arguments": dict}
+    """
+    if not text or "<tool_call>" not in text:
+        return text or "", []
+
+    blocks = TOOL_CALL_BLOCK_RE.findall(text)
+    calls = []
+    for block in blocks:
+        parsed = _parse_tool_call_block(block)
+        if parsed and parsed.get("name"):
+            calls.append(parsed)
+
+    clean_text = TOOL_CALL_BLOCK_RE.sub("", text).strip()
+    return clean_text, calls
+
+
+def to_openai_tool_calls(calls):
+    """Convert parsed calls into the OpenAI `tool_calls` array."""
+    tool_calls = []
+    for call in calls:
+        args = call.get("arguments", {})
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": call.get("name", ""),
+                "arguments": args
+            }
+        })
+    return tool_calls
 
 
 def build_openai_error(message, error_type="invalid_request_error", status_code=400):
@@ -651,7 +769,7 @@ def chat_completions():
             sys_prompt = ""
             for msg in messages:
                 if msg.get("role") == "system":
-                    sys_prompt = msg.get("content", "")
+                    sys_prompt = msg.get("content") or ""
 
             # Configure function calling if tools are provided
             if tools:
@@ -663,28 +781,102 @@ def chat_completions():
 
             # Build prompt from messages
             role, prompt = get_last_input(messages)
+            response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
             if not stream:
                 # Non-streaming mode
                 output = run_inference(rkllm_model, prompt, role, enable_thinking, sampling_params, max_tokens)
+                clean_text, calls = parse_tool_calls(output)
+                tool_calls = to_openai_tool_calls(calls)
                 response = build_openai_response(
                     model_name=model_name,
-                    content=output,
-                    finish_reason="stop",
+                    content=(clean_text or None) if tool_calls else output,
+                    finish_reason="tool_calls" if tool_calls else "stop",
                     prompt_tokens=len(prompt.split()),
-                    completion_tokens=len(output.split())
+                    completion_tokens=len(output.split()),
+                    tool_calls=tool_calls or None,
+                    response_id=response_id
                 )
                 return jsonify(response)
             else:
                 # Streaming mode (SSE)
                 def sse_generate():
                     # Send initial chunk with role
-                    yield build_openai_stream_chunk(model_name, None, None)
+                    yield build_openai_stream_chunk(response_id, model_name, {"role": "assistant"})
+
+                    # The model may emit a <tool_call> block instead of plain text.
+                    # Buffer the tokens of such a block and turn them into
+                    # OpenAI `tool_calls` deltas at the end of the stream.
+                    buf = ""            # pending plain-text tokens
+                    tool_buf = ""       # tokens inside a <tool_call> block
+                    in_tool = False
+                    tool_blocks = []
+
+                    def flush_text(text):
+                        if text:
+                            return build_openai_stream_chunk(response_id, model_name, {"content": text})
+                        return None
 
                     for token in generate_stream(rkllm_model, prompt, role, enable_thinking, sampling_params, max_tokens):
-                        yield build_openai_stream_chunk(model_name, token, None)
+                        if not in_tool:
+                            buf += token
+                            if TOOL_CALL_OPEN in buf:
+                                pre, _, rest = buf.partition(TOOL_CALL_OPEN)
+                                chunk = flush_text(pre)
+                                if chunk:
+                                    yield chunk
+                                tool_buf = rest
+                                in_tool = True
+                                buf = ""
+                            else:
+                                # Hold back a possible partial "<tool_call>" tag
+                                hold = len(TOOL_CALL_OPEN) - 1
+                                if len(buf) > hold and TOOL_CALL_OPEN.startswith(buf[-hold:]):
+                                    chunk = flush_text(buf[:-hold])
+                                    if chunk:
+                                        yield chunk
+                                    buf = buf[-hold:]
+                        else:
+                            tool_buf += token
+                            if TOOL_CALL_CLOSE in tool_buf:
+                                block, _, rest = tool_buf.partition(TOOL_CALL_CLOSE)
+                                tool_blocks.append(block)
+                                tool_buf = ""
+                                in_tool = False
+                                buf = rest
 
-                    # Send final chunk with finish_reason
-                    yield build_openai_stream_chunk(model_name, "", "stop")
+                    if in_tool:
+                        # Unterminated tool call — treat the remainder as a block
+                        tool_blocks.append(tool_buf)
+                    else:
+                        chunk = flush_text(buf)
+                        if chunk:
+                            yield chunk
+
+                    _, calls = parse_tool_calls(
+                        "".join(f"{TOOL_CALL_OPEN}{b}{TOOL_CALL_CLOSE}" for b in tool_blocks)
+                    )
+                    tool_calls = to_openai_tool_calls(calls)
+
+                    if tool_calls:
+                        # OpenAI streams tool calls as deltas keyed by index.
+                        for idx, tc in enumerate(tool_calls):
+                            yield build_openai_stream_chunk(response_id, model_name, {
+                                "tool_calls": [{
+                                    "index": idx,
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["function"]["name"],
+                                        "arguments": tc["function"]["arguments"]
+                                    }
+                                }]
+                            })
+                        yield build_openai_stream_chunk(response_id, model_name, {}, "tool_calls")
+                    else:
+                        # Send final chunk with finish_reason
+                        yield build_openai_stream_chunk(response_id, model_name, {}, "stop")
+
                     yield "data: [DONE]\n\n"
 
                 return Response(

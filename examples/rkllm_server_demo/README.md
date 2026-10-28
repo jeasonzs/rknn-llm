@@ -147,9 +147,36 @@ if resp.status_code == 200:
 
 ### 2.2 Function Calling (Tool Use)
 
-> **Note:** This section uses **Qwen3** series models as an example. Other models (e.g., DeepSeek, LLaMA) may output tool calls in different formats — adjust `parse_tool_calls()` accordingly.
+> **Note:** This section uses **Qwen3** series models as an example. Other models (e.g., DeepSeek, LLaMA) may output tool calls in different formats — adjust the parsing in `flask_server.py` accordingly.
 
 Function Calling allows the model to automatically invoke predefined functions based on user requests, enabling access to real-time or precise information (e.g., weather, calculations).
+
+The server returns tool calls in the **standard OpenAI format**: the assistant message carries a `tool_calls` array and `finish_reason` is `"tool_calls"`. The raw `<tool_call>` text emitted by the model is parsed by the server and never leaks into `content`.
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "finish_reason": "tool_calls",
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_be8239aed4d24f0d96eeb9cb",
+        "type": "function",
+        "function": {
+          "name": "get_current_temperature",
+          "arguments": "{\"location\": \"San Francisco, CA, USA\"}"
+        }
+      }]
+    }
+  }]
+}
+```
+
+> **Note:** `function.arguments` is a JSON *string*, as in the OpenAI API. Use `json.loads()` before passing it to your function.
+
+In streaming mode the tool call arrives as a `delta.tool_calls` entry (with `index`, `id`, `type`, `function.name` and `function.arguments`), and the last chunk carries `finish_reason: "tool_calls"`.
 
 #### Scenario
 
@@ -158,7 +185,7 @@ Take weather query as an example: a user asks "What's the temperature in San Fra
 #### Quick Start (Recommended)
 
 ```python
-from chat_api_flask import RKLLMClient, TOOLS, parse_tool_calls, execute_tool_calls
+from chat_api_flask import RKLLMClient, TOOLS, execute_tool_calls
 
 client = RKLLMClient(base_url="http://x.x.x.x:8080")
 
@@ -169,7 +196,7 @@ messages = [
 
 # Step 1: Model returns which tools to call and with what arguments
 resp = client.chat(messages=messages, tools=TOOLS, stream=False)
-tool_calls = parse_tool_calls(resp["choices"][0]["message"]["content"])
+tool_calls = resp["choices"][0]["message"]["tool_calls"]
 
 # Step 2: Execute tool calls and append results to messages
 assistant_msg, tool_msgs = execute_tool_calls(tool_calls)
@@ -258,31 +285,31 @@ data = {
 }
 
 resp = session.post(server_url, json=data, headers=headers)
-server_answer = resp.json()["choices"][0]["message"]["content"]
+message = resp.json()["choices"][0]["message"]
 
-# Example model output:
-# <tool_call>
-# {"name": "get_current_temperature", "arguments": {"location": "San Francisco"}}
-# </tool_call>
-# <tool_call>
-# {"name": "get_temperature_date", "arguments": {"location": "San Francisco", "date": "2024-10-01"}}
-# </tool_call>
+# The server already returns OpenAI-style tool calls:
+# message["content"]    -> None (no plain text)
+# message["tool_calls"] -> [{"id": ..., "type": "function",
+#                            "function": {"name": ..., "arguments": "<json string>"}}]
+tool_calls = message["tool_calls"]
 ```
 
-**4) Parse tool calls and execute**
+**4) Execute the tool calls**
 
 ```python
-import re, json
-
-# Supports both JSON and XML-like tool_call formats
-matches = re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", server_answer, re.DOTALL)
-tool_calls = [json.loads(m) for m in matches]
+import json
 
 # Execute functions and build messages
 for tc in tool_calls:
-    name, args = tc["name"], tc["arguments"]
+    name = tc["function"]["name"]
+    args = json.loads(tc["function"]["arguments"])   # arguments is a JSON string
     result = FUNCTION_MAP[name](**args)
-    messages.append({"role": "tool", "name": name, "content": json.dumps(result)})
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tc["id"],
+        "name": name,
+        "content": json.dumps(result),
+    })
 ```
 
 **5) Second call: get the final answer**
@@ -301,8 +328,9 @@ print("A:", resp.json()["choices"][0]["message"]["content"])
 
 | Item | Description |
 |------|-------------|
-| **Model Compatibility** | This demo is based on Qwen3 series. For other models, adjust `parse_tool_calls()` regex and the `tool_response_str` parameter |
-| **Tool Call Format** | Qwen3 outputs `<tool_call>...</tool_call>` wrapped JSON. XML-like format (`<function=xxx><parameter=xxx>...</parameter></function>`) is also supported |
+| **Model Compatibility** | This demo is based on Qwen3 series. For other models, adjust the tool-call parsing in `flask_server.py` and the `tool_response_str` parameter |
+| **Tool Call Format** | The server parses the model's raw `<tool_call>...</tool_call>` output (JSON flavour and XML-like flavour) and returns it as OpenAI `tool_calls` |
+| **Streaming Tool Calls** | Tool calls are emitted as a `delta.tool_calls` chunk; the final chunk carries `finish_reason: "tool_calls"` |
 | **Multi-Tool Merging** | Multiple tool results are merged into a JSON array `[{...}, {...}]` before being sent to the model |
 | **Model Capability** | Weaker models (e.g., Qwen3-0.6B) may fail to return accurate tool call parameters |
 | **System Prompt** | The system prompt template is Qwen-specific; replace it with the appropriate template for your model |
